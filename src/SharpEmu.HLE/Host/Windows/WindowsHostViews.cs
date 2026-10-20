@@ -27,7 +27,62 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
     private const uint PAGE_EXECUTE_READWRITE = 0x40;
     private const uint PAGE_EXECUTE_WRITECOPY = 0x80;
     private const uint SEC_COMMIT = 0x8000000;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint GENERIC_EXECUTE = 0x20000000;
+    private const uint FILE_SHARE_READ = 0x1;
+    private const uint FILE_SHARE_WRITE = 0x2;
+    private const uint FILE_SHARE_DELETE = 0x4;
+    private const uint CREATE_ALWAYS = 2;
+    private const uint FILE_ATTRIBUTE_TEMPORARY = 0x100;
+    private const uint FILE_FLAG_DELETE_ON_CLOSE = 0x04000000;
+    private const uint FSCTL_SET_SPARSE = 0x900C4;
+    private const uint FILE_BEGIN = 0;
     private static readonly nint InvalidHandle = -1;
+
+    // A pagefile-backed SEC_COMMIT section charges the whole guest backing
+    // against the system commit limit at startup (~16.4 GiB). A sparse
+    // delete-on-close file mapping commits page tables up front and file pages
+    // only as the guest touches them, which lets the same 16 GiB guest address
+    // space boot on hosts that cannot supply that much commit.
+    //
+    // auto picks sparse on hosts with at most 32 GiB of physical RAM and keeps
+    // the committed section elsewhere. SHARPEMU_GUEST_BACKING=commit|sparse
+    // overrides the choice while it is being measured.
+    private const ulong SparseAutoPhysicalMemoryLimitKb = 32UL * 1024 * 1024;
+    private static readonly (bool Sparse, string Description) BackingMode = ResolveBackingMode();
+    private static bool UseSparseBacking => BackingMode.Sparse;
+    private static string BackingModeDescription => BackingMode.Description;
+
+    private static (bool Sparse, string Description) ResolveBackingMode()
+    {
+        var value = Environment.GetEnvironmentVariable("SHARPEMU_GUEST_BACKING")?.Trim();
+        if (string.Equals(value, "sparse", StringComparison.OrdinalIgnoreCase))
+        {
+            return (true, "requested");
+        }
+
+        if (string.Equals(value, "commit", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, "requested");
+        }
+
+        if (!string.IsNullOrEmpty(value) && !string.Equals(value, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Error.WriteLine(
+                $"[MEMORY][WARN] Unknown SHARPEMU_GUEST_BACKING value '{value}'; using the committed section.");
+            return (false, "fallback");
+        }
+
+        if (GetPhysicallyInstalledSystemMemory(out var installedKb) &&
+            installedKb > 0 &&
+            installedKb <= SparseAutoPhysicalMemoryLimitKb)
+        {
+            return (true, $"auto, physical_mib={installedKb / 1024}");
+        }
+
+        return (false, "auto, physical memory above the sparse threshold");
+    }
 
     public WindowsHostViews()
     {
@@ -49,9 +104,24 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
             return false;
         }
 
-        var handle = CreateFileMappingW(InvalidHandle, null, PAGE_EXECUTE_READWRITE | SEC_COMMIT, (uint)(size >> 32), (uint)size, null);
+        var fileHandle = InvalidHandle;
+        var sparse = UseSparseBacking && TryCreateSparseFile(size, out fileHandle);
+        if (UseSparseBacking && !sparse)
+        {
+            Console.Error.WriteLine(
+                "[MEMORY][WARN] Sparse guest backing was requested but could not be created; falling back to a committed section.");
+        }
+
+        var handle = sparse
+            ? CreateFileMappingW(fileHandle, null, PAGE_EXECUTE_READWRITE, (uint)(size >> 32), (uint)size, null)
+            : CreateFileMappingW(InvalidHandle, null, PAGE_EXECUTE_READWRITE | SEC_COMMIT, (uint)(size >> 32), (uint)size, null);
         if (handle == 0)
         {
+            if (fileHandle != InvalidHandle)
+            {
+                CloseHandle(fileHandle);
+            }
+
             return false;
         }
 
@@ -66,11 +136,61 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
         if (alias == null)
         {
             CloseHandle(handle);
+            if (fileHandle != InvalidHandle)
+            {
+                CloseHandle(fileHandle);
+            }
+
             return false;
         }
 
-        backing = new HostBackingObject((ulong)alias, size, ReleaseBackingObject) { Handle = handle };
+        backing = new HostBackingObject((ulong)alias, size, ReleaseBackingObject)
+        {
+            Handle = handle,
+            FileHandle = sparse ? fileHandle : InvalidHandle,
+        };
+        if (sparse)
+        {
+            Console.Error.WriteLine(
+                $"[MEMORY][INFO] Guest backing mode=sparse size_mib={size / (1024 * 1024)} " +
+                $"({BackingModeDescription}; demand-committed temporary file).");
+        }
+
         failure = HostViewFailure.None;
+        return true;
+    }
+
+    // Creates a delete-on-close temporary file, marks it sparse, and sizes it to
+    // the guest backing. The file removes itself when the last handle closes,
+    // including after a crash; no guest contents are left on disk.
+    private static bool TryCreateSparseFile(ulong size, out nint handle)
+    {
+        handle = InvalidHandle;
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            $"sharpemu-guest-backing-{Environment.ProcessId}-{Guid.NewGuid():N}.bin");
+        var created = CreateFileW(
+            path,
+            GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+            0);
+        if (created == InvalidHandle)
+        {
+            return false;
+        }
+
+        if (!DeviceIoControl(created, FSCTL_SET_SPARSE, 0, 0, 0, 0, out _, 0) ||
+            !SetFilePointerEx(created, (long)size, out _, FILE_BEGIN) ||
+            !SetEndOfFile(created))
+        {
+            CloseHandle(created);
+            return false;
+        }
+
+        handle = created;
         return true;
     }
 
@@ -289,6 +409,11 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
     {
         UnmapViewOfFile((void*)backing.AliasBase);
         CloseHandle(backing.Handle);
+        if (backing.FileHandle != InvalidHandle)
+        {
+            // FILE_FLAG_DELETE_ON_CLOSE removes the sparse backing here.
+            CloseHandle(backing.FileHandle);
+        }
     }
 
     private static uint GetNativeProtection(HostPageProtection protection) => protection switch
@@ -348,6 +473,25 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     private static partial nint CreateFileMappingW(nint file, void* attributes, uint protect, uint maximumSizeHigh, uint maximumSizeLow, ushort* name);
+
+    [LibraryImport("kernel32.dll", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial nint CreateFileW(string name, uint access, uint share, nint security, uint creation, uint flags, nint template);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool DeviceIoControl(nint device, uint code, nint inBuffer, uint inSize, nint outBuffer, uint outSize, out uint returned, nint overlapped);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFilePointerEx(nint file, long distance, out long newPosition, uint method);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetEndOfFile(nint file);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetPhysicallyInstalledSystemMemory(out ulong totalKilobytes);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MemoryAddressRequirements
