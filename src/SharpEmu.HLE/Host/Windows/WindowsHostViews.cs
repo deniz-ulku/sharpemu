@@ -105,11 +105,24 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
         }
 
         var fileHandle = InvalidHandle;
-        var sparse = UseSparseBacking && TryCreateSparseFile(size, out fileHandle);
-        if (UseSparseBacking && !sparse)
+        var sparse = false;
+        if (UseSparseBacking)
         {
-            Console.Error.WriteLine(
-                "[MEMORY][WARN] Sparse guest backing was requested but could not be created; falling back to a committed section.");
+            try
+            {
+                sparse = TryCreateSparseFile(size, out fileHandle);
+                if (!sparse)
+                {
+                    Console.Error.WriteLine(
+                        "[MEMORY][WARN] Sparse guest backing could not be created; falling back to a committed section.");
+                }
+            }
+            catch (Exception exception)
+            {
+                fileHandle = InvalidHandle;
+                Console.Error.WriteLine(
+                    $"[MEMORY][WARN] Sparse guest backing failed ({exception.Message}); falling back to a committed section.");
+            }
         }
 
         var handle = sparse
