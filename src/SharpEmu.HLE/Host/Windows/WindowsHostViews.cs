@@ -46,10 +46,12 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
     // only as the guest touches them, which lets the same 16 GiB guest address
     // space boot on hosts that cannot supply that much commit.
     //
-    // auto picks sparse on hosts with at most 32 GiB of physical RAM and keeps
-    // the committed section elsewhere. SHARPEMU_GUEST_BACKING=commit|sparse
-    // overrides the choice while it is being measured.
-    private const ulong SparseAutoPhysicalMemoryLimitKb = 32UL * 1024 * 1024;
+    // The committed section is the default: it is the path the project ships
+    // today and the one with the most testing. SHARPEMU_GUEST_BACKING=sparse
+    // opts into demand commit. `auto` is an experimental opt-in that selects
+    // sparse when the system has less than 20 GiB of available commit, i.e.
+    // when the 16.4 GiB section is close to not fitting.
+    private const ulong SparseAutoCommitReserveBytes = 20UL * 1024 * 1024 * 1024;
     private static readonly (bool Sparse, string Description) BackingMode = ResolveBackingMode();
     private static bool UseSparseBacking => BackingMode.Sparse;
     private static string BackingModeDescription => BackingMode.Description;
@@ -67,21 +69,48 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
             return (false, "requested");
         }
 
-        if (!string.IsNullOrEmpty(value) && !string.Equals(value, "auto", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrEmpty(value))
+        {
+            return (false, "default");
+        }
+
+        if (!string.Equals(value, "auto", StringComparison.OrdinalIgnoreCase))
         {
             Console.Error.WriteLine(
                 $"[MEMORY][WARN] Unknown SHARPEMU_GUEST_BACKING value '{value}'; using the committed section.");
             return (false, "fallback");
         }
 
+        if (GetAvailableCommitBytes(out var availableCommit))
+        {
+            return availableCommit < SparseAutoCommitReserveBytes
+                ? (true, $"auto, available_commit_mib={availableCommit / (1024 * 1024)}")
+                : (false, $"auto, available_commit_mib={availableCommit / (1024 * 1024)}");
+        }
+
+        // If the commit query is unavailable, fall back to physical RAM as a
+        // coarse signal rather than silently choosing the path that may OOM.
         if (GetPhysicallyInstalledSystemMemory(out var installedKb) &&
             installedKb > 0 &&
-            installedKb <= SparseAutoPhysicalMemoryLimitKb)
+            installedKb <= 32UL * 1024 * 1024)
         {
             return (true, $"auto, physical_mib={installedKb / 1024}");
         }
 
-        return (false, "auto, physical memory above the sparse threshold");
+        return (false, "auto, commit query unavailable and physical memory above 32 GiB");
+    }
+
+    private static bool GetAvailableCommitBytes(out ulong availableCommit)
+    {
+        var status = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
+        if (GlobalMemoryStatusEx(ref status))
+        {
+            availableCommit = status.ullAvailPageFile;
+            return true;
+        }
+
+        availableCommit = 0;
+        return false;
     }
 
     public WindowsHostViews()
@@ -185,13 +214,39 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
         var created = CreateFileW(
             path,
             GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
             0,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
             0);
         if (created == InvalidHandle)
         {
+            return false;
+        }
+
+        // The file is sparse, but the guest can still make it grow to the full
+        // backing size. Do not start on a volume that cannot hold that worst
+        // case; the caller will fall back to the committed section.
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (!string.IsNullOrEmpty(root))
+            {
+                var free = new DriveInfo(root).AvailableFreeSpace;
+                if (free < (long)size || free - (long)size < 256L * 1024 * 1024)
+                {
+                    CloseHandle(created);
+                    Console.Error.WriteLine(
+                        $"[MEMORY][WARN] Sparse guest backing skipped: volume has {free / (1024 * 1024)} MiB free, " +
+                        $"needs {size / (1024 * 1024)} MiB plus 256 MiB headroom.");
+                    return false;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            CloseHandle(created);
+            Console.Error.WriteLine($"[MEMORY][WARN] Sparse guest backing skipped: free-space query failed ({exception.Message}).");
             return false;
         }
 
@@ -505,6 +560,24 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetPhysicallyInstalledSystemMemory(out ulong totalKilobytes);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORYSTATUSEX
+    {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX status);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MemoryAddressRequirements
